@@ -348,6 +348,18 @@ export class AgentConfigurationManager {
                 mcpServerFieldName: 'mcpServers'
             },
             {
+                id: 'claude-code',
+                name: 'claude-code',
+                displayName: 'Claude Code',
+                // User-scope MCP servers live under the top-level `mcpServers` field of
+                // ~/.claude.json (shared across projects), distinct from the per-project
+                // `projects.<path>.mcpServers` entries Claude Code also stores there.
+                // See https://code.claude.com/docs/en/mcp.
+                configPath: path.join(os.homedir(), '.claude.json'),
+                configFormat: 'json',
+                mcpServerFieldName: 'mcpServers'
+            },
+            {
                 id: 'codex',
                 name: 'codex',
                 displayName: 'Codex',
@@ -368,6 +380,17 @@ export class AgentConfigurationManager {
             	type: 'http',
             	url: this.getMCPServerUrl(),
             	tools: ['*']
+            };
+        }
+
+        if (agent?.id === 'claude-code') {
+            // Claude Code's mcpServers schema only recognizes `type`/`url`/`headers`;
+            // `streamableHttp` (the shape the other JSON agents below use) isn't one of
+            // its accepted type values. Its docs treat `http` and `streamable-http` as
+            // aliases for the same Streamable HTTP transport DebugMCP speaks.
+            return {
+                type: 'http',
+                url: this.getMCPServerUrl()
             };
         }
 
@@ -436,11 +459,11 @@ export class AgentConfigurationManager {
                     continue; // DebugMCP not configured for this agent
                 }
 
-                // Check if it's using the old SSE configuration
+                // Claude Code's HTTP transport is current; still migrate legacy SSE endpoints.
                 const needsMigration = agent.id === 'copilot-cli'
                     ? debugmcpConfig.type !== 'http' || (debugmcpConfig.url && debugmcpConfig.url.endsWith('/sse'))
                     : debugmcpConfig.type === 'sse' ||
-                    debugmcpConfig.type === 'http' ||
+                    (debugmcpConfig.type === 'http' && agent.id !== 'claude-code') ||
                     (debugmcpConfig.url && debugmcpConfig.url.endsWith('/sse'));
 
                 if (needsMigration) {
