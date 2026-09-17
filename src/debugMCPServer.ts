@@ -1,19 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 
-import * as vscode from 'vscode';
 import { z } from 'zod';
 import * as http from 'http';
 import { randomUUID } from 'node:crypto';
-import {
-    DebuggingExecutor,
-    ConfigurationManager,
-    DebuggingHandler,
-    IDebuggingHandler
-} from '.';
+import { IDebuggingHandler } from './debuggingHandler';
 import { logger } from './utils/logger';
 import { withTimeout } from './utils/withTimeout';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 
 /**
@@ -126,11 +121,11 @@ export class DebugMCPServer {
         if (handlerFactory) {
             this.handlerFactory = handlerFactory;
         } else {
-            // Default (single-window) behaviour: debug in this very window.
-            const executor = new DebuggingExecutor();
-            const configManager = new ConfigurationManager();
-            const handler = new DebuggingHandler(executor, configManager, timeoutInSeconds);
-            this.handlerFactory = () => handler;
+            this.handlerFactory = () => new Proxy({}, {
+                get: () => async () => {
+                    throw new Error('No debugging host was configured for this DebugMCP server.');
+                }
+            }) as IDebuggingHandler;
         }
         this.port = port;
         this.hosts = Array.isArray(host) ? host : [host];
@@ -158,7 +153,7 @@ export class DebugMCPServer {
      * Build a fresh McpServer with all tools registered.
      * Called once per session, when an `initialize` request opens it.
      */
-    private createMcpServer(): McpServer {
+    private createMcpServer(debuggingHandler = this.handlerFactory()): McpServer {
         const server = new McpServer({
             name: 'debugmcp',
             version: '1.0.0',
@@ -172,7 +167,7 @@ export class DebugMCPServer {
                 'investigation workflow using the debugger, including breakpoint strategy, step-and-inspect ' +
                 'pattern and root-cause guidance.',
         });
-        this.setupTools(server, this.handlerFactory());
+        this.setupTools(server, debuggingHandler);
         return server;
     }
 
@@ -206,7 +201,7 @@ export class DebugMCPServer {
     private setupTools(server: McpServer, debuggingHandler: IDebuggingHandler) {
         // Start debugging tool
         server.registerTool('start_debugging', {
-            description: 'Start a VS Code debug session for a source file or for a single test method. ' +
+            description: 'Start a debug session for a source file or for a single test method. ' +
                 'Invoke the "debug-live" skill first.',
             inputSchema: {
                 fileFullPath: z.string().describe('Full path to the source code file to debug'),
@@ -217,7 +212,7 @@ export class DebugMCPServer {
                     'Leave empty to debug the entire file or test class.'
                 ),
                 configurationName: z.string().optional().describe(
-                    'Optional debug configuration name from launch.json. ' +
+                    'Optional debug configuration name. ' +
                     'If omitted, DebugMCP uses its default generated configuration.'
                 ),
             },
@@ -340,6 +335,25 @@ export class DebugMCPServer {
             },
         }, async (args: { waitForPauseSeconds?: number }) =>
             this.runTool('get_debug_status', () => debuggingHandler.handleGetDebugStatus(args)));
+    }
+
+    public async startStdio(): Promise<void> {
+        const debuggingHandler = this.handlerFactory();
+        const server = this.createMcpServer(debuggingHandler);
+        const transport = new StdioServerTransport();
+        transport.onclose = () => {
+            void this.disposeHandler(debuggingHandler);
+        };
+        await server.connect(transport);
+        logger.info('DebugMCP CLI listening on stdio');
+    }
+
+    private async disposeHandler(handler: IDebuggingHandler): Promise<void> {
+        try {
+            await handler.dispose?.();
+        } catch (error) {
+            logger.warn('Error disposing MCP debugging handler', error);
+        }
     }
 
     /**
@@ -472,6 +486,7 @@ export class DebugMCPServer {
                     } else if (!sessionId && isInitializeRequest(req.body)) {
                         // Brand-new session: build a transport + server and register it
                         // once the SDK assigns a session id.
+                        const debuggingHandler = this.handlerFactory();
                         transport = new StreamableHTTPServerTransport({
                             sessionIdGenerator: () => randomUUID(),
                             onsessioninitialized: (sid: string) => {
@@ -485,8 +500,9 @@ export class DebugMCPServer {
                                 delete this.transports[sid];
                                 logger.info(`MCP session closed: ${sid}`);
                             }
+                            void this.disposeHandler(debuggingHandler);
                         };
-                        const server = this.createMcpServer();
+                        const server = this.createMcpServer(debuggingHandler);
                         await server.connect(transport);
                     } else {
                         // No session id and not an initialize request — invalid.
