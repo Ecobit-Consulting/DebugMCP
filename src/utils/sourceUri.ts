@@ -1,6 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 
-import * as vscode from 'vscode';
+import type * as vscode from 'vscode';
 
 /**
  * True when a source location is a URI rather than a native filesystem path.
@@ -17,5 +17,6 @@ export function isSourceUri(source: string): boolean {
 
 /** Preserve virtual-document schemes while retaining native path behavior. */
 export function toSourceUri(source: string): vscode.Uri {
-	return isSourceUri(source) ? vscode.Uri.parse(source, true) : vscode.Uri.file(source);
+	const vscodeModule: typeof import('vscode') = require('vscode');
+	return isSourceUri(source) ? vscodeModule.Uri.parse(source, true) : vscodeModule.Uri.file(source);
 }

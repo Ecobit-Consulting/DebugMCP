@@ -2,7 +2,9 @@
 
 ## Purpose
 
-Low-level wrapper around VS Code's Debug API and Debug Adapter Protocol (DAP). Executes actual debugging commands and retrieves debug state.
+Host abstraction for executing debugging commands and retrieving debug state.
+The VS Code implementation wraps the editor Debug API, while the standalone CLI
+implementation hosts a debug adapter directly over DAP stdio.
 
 ## Motivation
 
@@ -31,12 +33,43 @@ VS Code's debug API is powerful but requires careful handling. `DebuggingExecuto
         │
         ▼ Calls
 ┌───────────────────┐
-│  VS Code Debug API │
-│  (DAP Protocol)    │
+│ VS Code Debug API │
+│ or CLI DAP Client │
 └───────────────────┘
 ```
 
+### Standalone CLI host
+
+`src/cli/cliDebuggingExecutor.ts` implements the same executor interface without
+VS Code. It starts an explicitly registered adapter, performs the DAP
+initialize/launch/configuration sequence, handles adapter events and
+`runInTerminal`, and owns session, thread, frame, and breakpoint state.
+Step operations wait for a fresh stopped or terminated event. Continue allows a
+short stop-event grace period so immediately reached breakpoints are reported,
+while still returning promptly for long-running programs.
+Closing an MCP session disposes its standalone executor, adapter process, and
+any debuggee processes started through reverse `runInTerminal` requests.
+`src/cli/adapterConfig.ts` loads project and user registrations. No adapter is
+registered, discovered, selected, installed, or upgraded implicitly.
+
 ## Key Concepts
+
+### Startup Failure Diagnostics
+
+`src/utils/debugStartup.ts` observes task lifecycle events before dispatching a
+launch. It correlates newly started executions with the selected configuration's
+`preLaunchTask` and labeled `dependsOn` tasks in the same workspace. Nonzero exit
+codes produce an error naming the task and configuration, even if VS Code is
+still waiting for the user to dismiss a task-failure dialog. Reporting the failure
+does not dismiss that dialog or cancel VS Code's pending launch request.
+
+Thrown configuration/adapter errors are preserved. When VS Code declines startup
+without details, the response directs the caller to launch/task configuration
+and diagnostic output instead of assuming a missing language extension. Task
+events expose an exit code, not terminal text; the response makes that limitation
+explicit rather than inventing the underlying command error.
+Task-identifier objects and dynamically supplied task configuration are not
+resolved by this observer; startup still proceeds through VS Code normally.
 
 ### VS Code Debug Commands
 
@@ -79,6 +112,8 @@ A session is considered "ready" when:
 2. Location info is available (file name and line number)
 
 This handles cases where the debugger is still initializing (common with Python).
+`waitForDebugSessionReady()` accepts cancellation so a failed startup does not
+leave its readiness timeout and event subscriptions behind.
 
 ### State Retrieval
 
@@ -113,3 +148,7 @@ For `coreclr` debug type, the executor uses a different approach:
 - Executes `testing.debugCurrentFile` command
 
 This handles .NET's test debugging workflow which differs from other languages.
+
+## Variable inspection
+
+When a parent advertises indexed children, retrieve both indexed and named groups, including adapters that omit the named count. This preserves custom properties on containers. Parents without indexed children retain the unfiltered variables request.

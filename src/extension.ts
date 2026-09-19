@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { randomUUID } from 'node:crypto';
 import { DebugMCPServer } from './debugMCPServer';
 import { DebuggingExecutor, ConfigurationManager, DebuggingHandler } from '.';
@@ -22,9 +23,12 @@ const HEARTBEAT_INTERVAL_MS = 15_000;
 const ROUTER_RETRY_INTERVAL_MS = 5_000;
 
 export async function activate(context: vscode.ExtensionContext) {
+    const outputChannel = vscode.window.createOutputChannel('DebugMCP', { log: true });
+    context.subscriptions.push(outputChannel);
+    logger.setSink(outputChannel);
     // Initialize logging first
     logger.info('DebugMCP extension is now active!');
-    logger.logSystemInfo();
+    logger.logSystemInfo(`VS Code ${vscode.version}`);
     logger.logEnvironment();
 
     const config = vscode.workspace.getConfiguration('debugmcp');
@@ -72,7 +76,8 @@ export async function activate(context: vscode.ExtensionContext) {
         controlServer = new ControlServer(localHandler, controlToken);
         const controlPort = await controlServer.start();
 
-        registry = new WorkspaceRegistry();
+        const registryDir = path.join(context.globalStorageUri.fsPath, 'window-registry');
+        registry = new WorkspaceRegistry(process.pid, registryDir);
         const registerSelf = () => {
             registry?.register({
                 controlPort,

@@ -1,11 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 
-import * as vscode from 'vscode';
+import * as fs from 'node:fs';
 import { DebugConfigurationManager, IDebugConfigurationManager } from './utils/debugConfigurationManager';
 import { DebugState } from './debugState';
 import { IDebuggingExecutor } from './debuggingExecutor';
 import { logger } from './utils/logger';
-import { toSourceUri } from './utils/sourceUri';
+import { isSourceUri } from './utils/sourceUri';
 import {
     isSensitiveExpression,
     isSensitiveName,
@@ -36,6 +36,7 @@ export interface IDebuggingHandler {
     handleListVariableNames(args?: { scope?: 'local' | 'global' | 'all' }): Promise<string>;
     handleEvaluateExpression(args: { expression: string }): Promise<string>;
     handleGetDebugStatus(args?: { waitForPauseSeconds?: number }): Promise<string>;
+    dispose?(): Promise<void> | void;
 }
 
 /**
@@ -71,6 +72,10 @@ export class DebuggingHandler implements IDebuggingHandler {
         this.timeoutInSeconds = timeoutInSeconds;
     }
 
+    public async dispose(): Promise<void> {
+        await this.executor.dispose?.();
+    }
+
     /**
      * Start a debugging session
      */
@@ -84,21 +89,19 @@ export class DebuggingHandler implements IDebuggingHandler {
         const hasExplicitConfig = !!configurationName &&
             configurationName.trim() !== '' &&
             configurationName !== DebugConfigurationManager.getAutoLaunchConfigName();
+        const readinessAbort = new AbortController();
 		
         try {
             logger.info(`handleStartDebugging: file=${fileFullPath} test=${testName ?? '<none>'} config=${configurationName ?? '<auto>'}`);
 
-            // Start listening BEFORE we trigger the debug session, otherwise
-            // `onDidStartDebugSession` / `onDidChangeActiveStackItem` can fire
-            // during the trigger call (testing.debugAtCursor / vscode.debug.startDebugging
-            // can resolve only after the session is already up) and we'd miss them.
-            const readyPromise = this.executor.waitForDebugSessionReady(this.timeoutInSeconds * 1000);
-
+            let readyPromise: ReturnType<IDebuggingExecutor['waitForDebugSessionReady']>;
             let started: boolean;
             let configDescription: string;
             let testRunComplete: Promise<void> | undefined;
 
             if (testName && !hasExplicitConfig) {
+                readyPromise = this.executor.waitForDebugSessionReady(
+                    this.timeoutInSeconds * 1000, readinessAbort.signal);
                 // Route through VS Code's Testing API. This works for any language
                 // whose extension registers a TestController and correctly handles
                 // child-process attach for runners like `dotnet test`.
@@ -112,6 +115,10 @@ export class DebuggingHandler implements IDebuggingHandler {
                     fileFullPath,
                     configurationName
                 );
+                // Subscribe before launch so fast debug events are not lost,
+                // but only after configuration resolution has succeeded.
+                readyPromise = this.executor.waitForDebugSessionReady(
+                    this.timeoutInSeconds * 1000, readinessAbort.signal);
                 started = await this.executor.startDebugging(workingDirectory, debugConfig);
                 const configName = typeof debugConfig === 'string' ? debugConfig : debugConfig.name;
                 configDescription = configName ? `configuration '${configName}'` : 'default configuration';
@@ -142,15 +149,17 @@ export class DebuggingHandler implements IDebuggingHandler {
                     case 'terminated':
                         return `Debug session for ${fileFullPath} ran to completion without stopping (no breakpoint hit). Using ${configDescription}${testInfo}. Final state: ${currentState.toString()}`;
                     case 'no-session':
-                        throw new Error('Debug session failed to start within the timeout period. Make sure the appropriate language extension is installed and any required build step succeeded.');
+                        throw new Error('No debug session started within the timeout period. Check launch.json, any preLaunchTask in tasks.json, and the task terminal or Debug Console for startup errors.');
                     case 'timeout':
                         return `Debug session is running but did not stop or terminate within the timeout for: ${fileFullPath} using ${configDescription}${testInfo}. Current state: ${currentState.toString()}`;
                 }
             } else {
-                throw new Error('Failed to start debug session. Make sure the appropriate language extension is installed.');
+                throw new Error('Failed to start debug session: VS Code declined or cancelled startup without providing an error detail. Check launch.json, any preLaunchTask in tasks.json, and the task terminal or Debug Console.');
             }
         } catch (error) {
             throw new Error(`Error starting debug session: ${error}`);
+        } finally {
+            readinessAbort.abort();
         }
     }
 
@@ -183,7 +192,7 @@ export class DebuggingHandler implements IDebuggingHandler {
                 return 'No breakpoints to clear';
             }
 
-            this.executor.clearAllBreakpoints();
+            await this.executor.clearAllBreakpoints();
             return `Successfully cleared ${breakpointCount} breakpoint(s)`;
         } catch (error) {
             throw new Error(`Error clearing breakpoints: ${error}`);
@@ -342,47 +351,13 @@ export class DebuggingHandler implements IDebuggingHandler {
      * it resolves with the current state rather than rejecting.
      */
     private async waitForPause(timeoutMs: number): Promise<DebugState> {
-        const subscriptions: vscode.Disposable[] = [];
-        try {
-            await new Promise<void>(resolve => {
-                let settled = false;
-                const settle = (reason: string) => {
-                    if (settled) {
-                        return;
-                    }
-                    settled = true;
-                    logger.info(`waitForPause: settled on ${reason}`);
-                    clearTimeout(timer);
-                    resolve();
-                };
-
-                const timer = setTimeout(() => settle('timeout (still running)'), timeoutMs);
-
-                // Subscribe before the fast-path check so a stop landing during
-                // that async check cannot slip through unobserved.
-                subscriptions.push(
-                    vscode.debug.onDidChangeActiveStackItem(stackItem => {
-                        if (stackItem && 'frameId' in stackItem) {
-                            settle('breakpoint hit');
-                        }
-                    })
-                );
-                subscriptions.push(
-                    vscode.debug.onDidTerminateDebugSession(() => {
-                        if (!vscode.debug.activeDebugSession) {
-                            settle('session terminated');
-                        }
-                    })
-                );
-
-                void this.executor.getCurrentDebugState(this.numNextLines).then(currentState => {
-                    if (!currentState.sessionActive || currentState.hasLocationInfo()) {
-                        settle('fast path');
-                    }
-                });
-            });
-        } finally {
-            subscriptions.forEach(d => d.dispose());
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+            const state = await this.executor.getCurrentDebugState(this.numNextLines);
+            if (!state.sessionActive || state.hasLocationInfo()) {
+                return state;
+            }
+            await new Promise(resolve => setTimeout(resolve, Math.min(100, deadline - Date.now())));
         }
         return this.executor.getCurrentDebugState(this.numNextLines);
     }
@@ -430,13 +405,12 @@ export class DebuggingHandler implements IDebuggingHandler {
 
             // Validate the line exists so we fail clearly instead of setting an
             // unbound breakpoint past the end of the file.
-            const uri = toSourceUri(fileFullPath);
-            const document = await vscode.workspace.openTextDocument(uri);
-            if (line > document.lineCount) {
-                throw new Error(`Line ${line} is out of range: ${fileFullPath} has ${document.lineCount} lines.`);
+            const lineCount = await this.getFileLineCount(fileFullPath);
+            if (line > lineCount) {
+                throw new Error(`Line ${line} is out of range: ${fileFullPath} has ${lineCount} lines.`);
             }
 
-            await this.executor.addBreakpoint(uri, line, condition);
+            await this.executor.addBreakpoint(fileFullPath, line, condition);
 
             const conditionInfo = condition ? ` (condition: ${condition})` : '';
             return `Breakpoint added at ${fileFullPath}:${line}${conditionInfo}${await this.sessionCaveat()}`;
@@ -486,13 +460,12 @@ export class DebuggingHandler implements IDebuggingHandler {
 
             // Validate the line exists so we fail clearly instead of setting an
             // unbound logpoint past the end of the file.
-            const uri = toSourceUri(fileFullPath);
-            const document = await vscode.workspace.openTextDocument(uri);
-            if (line > document.lineCount) {
-                throw new Error(`Line ${line} is out of range: ${fileFullPath} has ${document.lineCount} lines.`);
+            const lineCount = await this.getFileLineCount(fileFullPath);
+            if (line > lineCount) {
+                throw new Error(`Line ${line} is out of range: ${fileFullPath} has ${lineCount} lines.`);
             }
 
-            await this.executor.addBreakpoint(uri, line, condition, logMessage);
+            await this.executor.addBreakpoint(fileFullPath, line, condition, logMessage);
 
             const conditionInfo = condition ? ` (condition: ${condition})` : '';
             return `Logpoint added at ${fileFullPath}:${line}${conditionInfo}${await this.sessionCaveat()}`;
@@ -508,23 +481,17 @@ export class DebuggingHandler implements IDebuggingHandler {
         const { fileFullPath, line } = args;
         
         try {
-            const uri = toSourceUri(fileFullPath);
-            
+
             // Check if breakpoint exists at this location
             const breakpoints = this.executor.getBreakpoints();
-            const existingBreakpoint = breakpoints.find(bp => {
-                if (bp instanceof vscode.SourceBreakpoint) {
-                    return bp.location.uri.toString() === uri.toString() && 
-                           bp.location.range.start.line === line - 1;
-                }
-                return false;
-            });
+            const existingBreakpoint = breakpoints.find(bp =>
+                bp.fileFullPath === fileFullPath && bp.line === line);
             
             if (!existingBreakpoint) {
                 return `No breakpoint found at ${fileFullPath}:${line}`;
             }
             
-            await this.executor.removeBreakpoint(uri, line);
+            await this.executor.removeBreakpoint(fileFullPath, line);
             return `Breakpoint removed from ${fileFullPath}:${line}`;
         } catch (error) {
             throw new Error(`Error removing breakpoint: ${error}`);
@@ -544,16 +511,11 @@ export class DebuggingHandler implements IDebuggingHandler {
 
             let breakpointList = 'Active Breakpoints:\n';
             breakpoints.forEach((bp, index) => {
-                if (bp instanceof vscode.SourceBreakpoint) {
-                    const fileName = bp.location.uri.fsPath.split(/[/\\]/).pop();
-                    const line = bp.location.range.start.line + 1;
-                    const conditionInfo = bp.condition ? ` (condition: ${bp.condition})` : '';
-                    const kind = bp.logMessage ? `Logpoint` : `Breakpoint`;
-                    const logInfo = bp.logMessage ? ` (log: ${bp.logMessage})` : '';
-                    breakpointList += `${index + 1}. ${kind} ${fileName}:${line}${conditionInfo}${logInfo}\n`;
-                } else if (bp instanceof vscode.FunctionBreakpoint) {
-                    breakpointList += `${index + 1}. Function: ${bp.functionName}\n`;
-                }
+                const fileName = bp.fileFullPath.split(/[/\\]/).pop();
+                const conditionInfo = bp.condition ? ` (condition: ${bp.condition})` : '';
+                const kind = bp.logMessage ? 'Logpoint' : 'Breakpoint';
+                const logInfo = bp.logMessage ? ` (log: ${bp.logMessage})` : '';
+                breakpointList += `${index + 1}. ${kind} ${fileName}:${bp.line}${conditionInfo}${logInfo}\n`;
             });
 
             return breakpointList;
@@ -579,12 +541,12 @@ export class DebuggingHandler implements IDebuggingHandler {
             throw new Error('Debug session is not ready. Start debugging first and ensure execution is paused.');
         }
 
-        const activeStackItem = vscode.debug.activeStackItem;
-        if (!activeStackItem || !('frameId' in activeStackItem)) {
+        const frameId = this.executor.getActiveFrameId?.();
+        if (frameId === undefined) {
             throw new Error('No active stack frame. Make sure execution is paused at a breakpoint.');
         }
 
-        return activeStackItem.frameId;
+        return frameId;
     }
 
     /**
@@ -683,6 +645,26 @@ export class DebuggingHandler implements IDebuggingHandler {
             return false;
         }
         return /[*&]\s*$/.test(type.split(/\r?\n/, 1)[0].trim());
+    }
+
+    /**
+     * Some adapters expose implementation metadata as children of scalar
+     * values. Ruby rdbg, for example, gives Integer and String values a
+     * variablesReference for #class and other internals. Those references do
+     * not make the user value an aggregate and should not hide its result.
+     */
+    private isScalarLikeType(type: unknown): boolean {
+        if (this.executor.getActiveSession?.()?.type.toLowerCase() !== 'ruby_lsp' || typeof type !== 'string') {
+            return false;
+        }
+
+        const typeName = type.split(/\r?\n/, 1)[0].trim();
+        return /^(?:Integer|Float|Rational|Complex|String|Symbol|TrueClass|FalseClass|NilClass|Regexp)$/.test(typeName);
+    }
+
+    private isAdapterMetadataVariable(variable: any): boolean {
+        return this.executor.getActiveSession?.()?.type.toLowerCase() === 'ruby_lsp' &&
+            (variable?.name === '#class' || variable?.name === '%ancestors');
     }
 
     /**
@@ -815,17 +797,18 @@ export class DebuggingHandler implements IDebuggingHandler {
                 throw new Error('Debug session is not ready. Start debugging first and ensure execution is paused.');
             }
 
-            const activeStackItem = vscode.debug.activeStackItem;
-            if (!activeStackItem || !('frameId' in activeStackItem)) {
+            const frameId = this.executor.getActiveFrameId?.();
+            if (frameId === undefined) {
                 throw new Error('No active stack frame. Make sure execution is paused at a breakpoint.');
             }
 
-            const response = await this.executor.evaluateExpression(expression, activeStackItem.frameId);
+            const response = await this.executor.evaluateExpression(expression, frameId);
 
             if (response && response.result !== undefined) {
                 let resultText = `Expression: ${expression}\n`;
                 const isComplex = response.variablesReference > 0 &&
-                    !DebuggingHandler.isPointerLikeType(response.type);
+                    !DebuggingHandler.isPointerLikeType(response.type) &&
+                    !this.isScalarLikeType(response.type);
                 const expressionIsSensitive = isSensitiveExpression(expression);
                 const { value, redacted } = isComplex
                     ? {
@@ -843,7 +826,8 @@ export class DebuggingHandler implements IDebuggingHandler {
                         '  ',
                         1,
                         new Set<number>(),
-                        { remaining: this.maxExpandedFields }
+                        { remaining: this.maxExpandedFields },
+                        response
                     );
                     if (children.text) {
                         resultText += `\n${children.text}`;
@@ -892,7 +876,8 @@ export class DebuggingHandler implements IDebuggingHandler {
         let redacted = false;
         const variablesReference = Number(variable.variablesReference) || 0;
         const isComplex = variablesReference > 0 &&
-            !DebuggingHandler.isPointerLikeType(variable.type);
+            !DebuggingHandler.isPointerLikeType(variable.type) &&
+            !this.isScalarLikeType(variable.type);
         if (includeValue && isComplex) {
             const redactionName = DebuggingHandler.redactionVariableName(variable, name);
             if (isSensitiveName(redactionName)) {
@@ -916,7 +901,8 @@ export class DebuggingHandler implements IDebuggingHandler {
                 `${indent}  `,
                 depth + 1,
                 visitedReferences,
-                expansionBudget
+                expansionBudget,
+                variable
             );
             if (children.text) {
                 text += `\n${children.text}`;
@@ -932,7 +918,8 @@ export class DebuggingHandler implements IDebuggingHandler {
         indent: string,
         depth: number,
         visitedReferences: Set<number>,
-        expansionBudget: { remaining: number }
+        expansionBudget: { remaining: number },
+        parent: any = {}
     ): Promise<{ text: string; redacted: boolean }> {
         if (depth > this.maxVariableExpansionDepth) {
             return { text: `${indent}<maximum expansion depth reached>`, redacted: false };
@@ -943,7 +930,9 @@ export class DebuggingHandler implements IDebuggingHandler {
 
         const nextVisited = new Set(visitedReferences);
         nextVisited.add(variablesReference);
-        const children = await this.executor.getVariableChildren(variablesReference);
+        const children = (await this.executor.getVariableChildren(variablesReference, {
+            indexedVariables: parent.indexedVariables
+        })).filter(child => !this.isAdapterMetadataVariable(child));
         const rendered: string[] = [];
         let redacted = false;
         let renderedChildren = 0;
@@ -1012,80 +1001,30 @@ export class DebuggingHandler implements IDebuggingHandler {
      */
     private async waitForStateChange(beforeState: DebugState, settleOnResume = false): Promise<DebugState> {
         const timeoutMs = this.timeoutInSeconds * 1000;
-        const subscriptions: vscode.Disposable[] = [];
         const operatingSession = this.executor.getActiveSession();
-        let operatingSessionTerminated = false;
-
-        try {
-            await new Promise<void>(resolve => {
-                let settled = false;
-                const settle = (reason: string) => {
-                    if (settled) {
-                        return;
-                    }
-                    settled = true;
-                    logger.info(`waitForStateChange: settled on ${reason}`);
-                    clearTimeout(timer);
-                    resolve();
-                };
-
-                const timer = setTimeout(() => {
-                    logger.info('State change detection timed out, returning current state');
-                    settle('timeout');
-                }, timeoutMs);
-
-                // Register listeners BEFORE the fast-path check so a stop that
-                // lands during that async check can't slip through unobserved.
-                subscriptions.push(
-                    vscode.debug.onDidChangeActiveStackItem(stackItem => {
-                        // A newly focused stack frame is the signal that the
-                        // step/continue has landed at its next stop.
-                        if (stackItem && 'frameId' in stackItem) {
-                            settle('new stack frame');
-                        } else if (settleOnResume && !stackItem) {
-                            // Continue only: the active stack item being cleared
-                            // means the program resumed. That IS the terminal
-                            // state for a continue against a process that keeps
-                            // running (a server, an event loop) and will never
-                            // stop again on its own.
-                            settle('program resumed');
-                        }
-                    })
-                );
-                subscriptions.push(
-                    vscode.debug.onDidTerminateDebugSession(session => {
-                        // continue/step that runs the program to completion.
-                        if (operatingSession && session.id === operatingSession.id) {
-                            operatingSessionTerminated = true;
-                            settle('session terminated');
-                        } else if (!vscode.debug.activeDebugSession) {
-                            settle('no active session');
-                        }
-                    })
-                );
-
-                // Fast path: the step/continue may already have landed by the
-                // time we subscribed (e.g. a trivial single-line step), or the
-                // program may already be running again after a continue.
-                void this.executor.getCurrentDebugState(this.numNextLines).then(currentState => {
-                    const resumed = settleOnResume && currentState.sessionActive && !currentState.hasLocationInfo();
-                    if (this.hasStateChanged(beforeState, currentState) || !currentState.sessionActive || resumed) {
-                        settle('fast path');
-                    }
-                });
-            });
-        } finally {
-            subscriptions.forEach(d => d.dispose());
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+            const currentState = await this.executor.getCurrentDebugState(this.numNextLines);
+            const resumed = settleOnResume && currentState.sessionActive && !currentState.hasLocationInfo();
+            if (this.hasStateChanged(beforeState, currentState) || !currentState.sessionActive || resumed) {
+                return currentState;
+            }
+            await new Promise(resolve => setTimeout(resolve, Math.min(50, deadline - Date.now())));
         }
 
         const afterState = await this.executor.getCurrentDebugState(this.numNextLines);
-        // The operating session ended (program ran to completion). A lingering
-        // parent session (e.g. the JS debug terminal) can leave a different
-        // session reported as active, so reflect termination explicitly here.
-        if (operatingSessionTerminated) {
+        if (operatingSession && this.executor.getActiveSession()?.id !== operatingSession.id) {
             afterState.sessionActive = false;
         }
         return afterState;
+    }
+
+    private async getFileLineCount(fileFullPath: string): Promise<number> {
+        if (this.executor.getFileLineCount) {
+            return await this.executor.getFileLineCount(fileFullPath);
+        }
+        const content = await fs.promises.readFile(fileFullPath, 'utf8');
+        return content.length === 0 ? 0 : content.split(/\r?\n/).length;
     }
 
     /**

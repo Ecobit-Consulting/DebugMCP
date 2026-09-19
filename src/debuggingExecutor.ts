@@ -1,9 +1,17 @@
+import * as fs from 'node:fs';
+import { isSourceUri } from './utils/sourceUri';
+
+function toSourceUri(source: string): vscode.Uri {
+    return isSourceUri(source) ? vscode.Uri.parse(source, true) : vscode.Uri.file(source);
+}
 // Copyright (c) Microsoft Corporation.
 
 import * as vscode from 'vscode';
 import { DebugState, StackFrame } from './debugState';
+import { DebugBreakpoint, DebugConfiguration, DebugSessionInfo } from './debugTypes';
 import { logger } from './utils/logger';
 import { withTimeout } from './utils/withTimeout';
+import { getDebugStartupContext, startDebuggingWithDiagnostics } from './utils/debugStartup';
 
 /**
  * Outcome of dispatching `testing.debugAtCursor`.
@@ -23,27 +31,34 @@ export interface TestDebugDispatch {
 /**
  * Interface for debugging execution operations
  */
+export interface VariableChildrenOptions {
+    indexedVariables?: number;
+}
+
 export interface IDebuggingExecutor {
-    startDebugging(workingDirectory: string, config: string | vscode.DebugConfiguration): Promise<boolean>;
+    startDebugging(workingDirectory: string, config: string | DebugConfiguration): Promise<boolean>;
     debugTestAtCursor(fileFullPath: string, testName: string): Promise<TestDebugDispatch>;
-    stopDebugging(session?: vscode.DebugSession): Promise<void>;
+    stopDebugging(session?: DebugSessionInfo): Promise<void>;
     stepOver(): Promise<void>;
     stepInto(): Promise<void>;
     stepOut(): Promise<void>;
     continue(): Promise<void>;
     pause(): Promise<void>;
     restart(): Promise<void>;
-    addBreakpoint(uri: vscode.Uri, line: number, condition?: string, logMessage?: string): Promise<void>;
-    removeBreakpoint(uri: vscode.Uri, line: number): Promise<void>;
+    addBreakpoint(fileFullPath: string, line: number, condition?: string, logMessage?: string): Promise<void>;
+    removeBreakpoint(fileFullPath: string, line: number): Promise<void>;
     getCurrentDebugState(numNextLines: number): Promise<DebugState>;
     getVariables(frameId: number, scope?: 'local' | 'global' | 'all'): Promise<any>;
-    getVariableChildren(variablesReference: number): Promise<any[]>;
+    getVariableChildren(variablesReference: number, options?: VariableChildrenOptions): Promise<any[]>;
     evaluateExpression(expression: string, frameId: number): Promise<any>;
-    getBreakpoints(): readonly vscode.Breakpoint[];
-    clearAllBreakpoints(): void;
+    getBreakpoints(): readonly DebugBreakpoint[];
+    clearAllBreakpoints(): Promise<void> | void;
     hasActiveSession(): Promise<boolean>;
-    getActiveSession(): vscode.DebugSession | undefined;
-    waitForDebugSessionReady(timeoutMs: number): Promise<'stopped' | 'terminated' | 'timeout' | 'no-session' | 'attached'>;
+    getActiveSession(): DebugSessionInfo | undefined;
+    getActiveFrameId?(): number | undefined;
+    waitForDebugSessionReady(timeoutMs: number, signal?: AbortSignal): Promise<'stopped' | 'terminated' | 'timeout' | 'no-session' | 'attached'>;
+    getFileLineCount?(fileFullPath: string): Promise<number>;
+    dispose?(): Promise<void> | void;
 }
 
 /**
@@ -77,13 +92,29 @@ export class DebuggingExecutor implements IDebuggingExecutor {
     /**
      * Start a debugging session
      */
+    public async getFileLineCount(fileFullPath: string): Promise<number> {
+        if (isSourceUri(fileFullPath)) {
+            const uri = toSourceUri(fileFullPath);
+            const document = await vscode.workspace.openTextDocument(uri);
+            return document.lineCount;
+        }
+        const content = await fs.promises.readFile(fileFullPath, 'utf8');
+        return content.length === 0 ? 0 : content.split(/\r?\n/).length;
+    }
+
     public async startDebugging(
         workingDirectory: string, 
-        config: string | vscode.DebugConfiguration
+        config: string | DebugConfiguration
     ): Promise<boolean> {
         try {
             const workspaceFolder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(workingDirectory));
-            return await vscode.debug.startDebugging(workspaceFolder, config);
+            return await startDebuggingWithDiagnostics(
+                () => vscode.debug.startDebugging(
+                    workspaceFolder,
+                    config as string | vscode.DebugConfiguration
+                ),
+                getDebugStartupContext(config as string | vscode.DebugConfiguration, workspaceFolder)
+            );
         } catch (error) {
             throw new Error(`Failed to start debugging: ${error}`);
         }
@@ -137,6 +168,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
             .then(() => undefined)
             .catch(err => {
                 logger.error(`testing.debugAtCursor failed: ${err}`);
+                throw err;
             });
         return { started: true, runComplete };
     }
@@ -245,9 +277,12 @@ export class DebuggingExecutor implements IDebuggingExecutor {
     /**
      * Stop the debugging session
      */
-    public async stopDebugging(session?: vscode.DebugSession): Promise<void> {
+    public async stopDebugging(session?: DebugSessionInfo): Promise<void> {
         try {
-            const activeSession = session || vscode.debug.activeDebugSession;
+            const currentSession = vscode.debug.activeDebugSession;
+            const activeSession = !session || currentSession?.id === session.id
+                ? currentSession
+                : undefined;
             if (activeSession) {
                 await vscode.debug.stopDebugging(activeSession);
             }
@@ -330,8 +365,9 @@ export class DebuggingExecutor implements IDebuggingExecutor {
      * evaluates to true. An optional logMessage makes it a logpoint that logs
      * the message (with {expressions} interpolated) instead of pausing.
      */
-    public async addBreakpoint(uri: vscode.Uri, line: number, condition?: string, logMessage?: string): Promise<void> {
+    public async addBreakpoint(fileFullPath: string, line: number, condition?: string, logMessage?: string): Promise<void> {
         try {
+            const uri = toSourceUri(fileFullPath);
             const breakpoint = new vscode.SourceBreakpoint(
                 new vscode.Location(uri, new vscode.Position(line - 1, 0)),
                 true,
@@ -348,8 +384,9 @@ export class DebuggingExecutor implements IDebuggingExecutor {
     /**
      * Remove a breakpoint from specified location
      */
-    public async removeBreakpoint(uri: vscode.Uri, line: number): Promise<void> {
+    public async removeBreakpoint(fileFullPath: string, line: number): Promise<void> {
         try {
+            const uri = toSourceUri(fileFullPath);
             const breakpoints = vscode.debug.breakpoints.filter(bp => {
                 if (bp instanceof vscode.SourceBreakpoint) {
                     return bp.location.uri.toString() === uri.toString() && 
@@ -551,7 +588,10 @@ export class DebuggingExecutor implements IDebuggingExecutor {
      * handler only reads children for variables explicitly requested by the
      * caller, rather than recursively dumping every value in scope.
      */
-    public async getVariableChildren(variablesReference: number): Promise<any[]> {
+    public async getVariableChildren(
+        variablesReference: number,
+        options: VariableChildrenOptions = {}
+    ): Promise<any[]> {
         if (variablesReference <= 0) {
             return [];
         }
@@ -562,9 +602,23 @@ export class DebuggingExecutor implements IDebuggingExecutor {
                 throw new Error('No active debug session');
             }
 
-            const response = await this.dapRequest(activeSession, 'variables', {
-                variablesReference
-            });
+            const indexedVariables = Number(options.indexedVariables) || 0;
+            if (indexedVariables > 0) {
+                const indexed = await this.dapRequest(activeSession, 'variables', {
+                    variablesReference,
+                    filter: 'indexed',
+                    start: 0,
+                    count: indexedVariables
+                });
+                // The named count is optional. Always request this group so
+                // containers with custom properties retain those children too.
+                const named = await this.dapRequest(activeSession, 'variables', {
+                    variablesReference,
+                    filter: 'named'
+                });
+                return [ ...(indexed?.variables ?? []), ...(named?.variables ?? []) ];
+            }
+            const response = await this.dapRequest(activeSession, 'variables', { variablesReference });
             return response?.variables || [];
         } catch (error) {
             throw new Error(`Failed to expand variable: ${error}`);
@@ -704,14 +758,24 @@ export class DebuggingExecutor implements IDebuggingExecutor {
     /**
      * Get all active breakpoints
      */
-    public getBreakpoints(): readonly vscode.Breakpoint[] {
-        return vscode.debug.breakpoints;
+    public getBreakpoints(): readonly DebugBreakpoint[] {
+        return vscode.debug.breakpoints
+            .filter((breakpoint): breakpoint is vscode.SourceBreakpoint =>
+                breakpoint instanceof vscode.SourceBreakpoint)
+            .map(breakpoint => ({
+                fileFullPath: isSourceUri(breakpoint.location.uri.toString())
+                    ? breakpoint.location.uri.toString()
+                    : breakpoint.location.uri.fsPath,
+                line: breakpoint.location.range.start.line + 1,
+                condition: breakpoint.condition,
+                logMessage: breakpoint.logMessage
+            }));
     }
 
     /**
      * Clear all breakpoints
      */
-    public clearAllBreakpoints(): void {
+    public async clearAllBreakpoints(): Promise<void> {
         const breakpoints = vscode.debug.breakpoints;
         if (breakpoints.length > 0) {
             vscode.debug.removeBreakpoints(breakpoints);
@@ -728,8 +792,20 @@ export class DebuggingExecutor implements IDebuggingExecutor {
     /**
      * Get the active debug session
      */
-    public getActiveSession(): vscode.DebugSession | undefined {
-        return vscode.debug.activeDebugSession;
+    public getActiveSession(): DebugSessionInfo | undefined {
+        const session = vscode.debug.activeDebugSession;
+        return session ? {
+            id: session.id,
+            name: session.name,
+            type: session.type,
+            request: session.configuration.request === 'attach' ? 'attach' :
+                session.configuration.request === 'launch' ? 'launch' : undefined
+        } : undefined;
+    }
+
+    public getActiveFrameId(): number | undefined {
+        const item = vscode.debug.activeStackItem;
+        return item && 'frameId' in item ? item.frameId : undefined;
     }
 
     /**
@@ -751,8 +827,12 @@ export class DebuggingExecutor implements IDebuggingExecutor {
      * start *and* terminate inside a polling interval.
      */
     public async waitForDebugSessionReady(
-        timeoutMs: number
+        timeoutMs: number,
+        signal?: AbortSignal
     ): Promise<'stopped' | 'terminated' | 'timeout' | 'no-session' | 'attached'> {
+        if (signal?.aborted) {
+            return 'no-session';
+        }
         // Helper: a session is only truly "stopped and actionable" when we have
         // a DebugStackFrame (frameId present). A bare DebugThread means a thread
         // is selected but the adapter hasn't published a frame yet — calling
@@ -793,6 +873,12 @@ export class DebuggingExecutor implements IDebuggingExecutor {
                 const timer = setTimeout(() => {
                     settle(trackedSession ? 'timeout' : 'no-session');
                 }, timeoutMs);
+
+                if (signal) {
+                    const abort = () => settle('no-session');
+                    signal.addEventListener('abort', abort, { once: true });
+                    subscriptions.push(new vscode.Disposable(() => signal.removeEventListener('abort', abort)));
+                }
 
                 subscriptions.push(
                     vscode.debug.onDidStartDebugSession(session => {

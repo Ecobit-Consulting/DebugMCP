@@ -1,11 +1,20 @@
 # DebugMCP (MCP Server) - Empowering AI Agents with Operational Debugging Capabilities
 
-Let AI agents debug your code inside VS Code - set breakpoints, step through execution, inspect variables, and evaluate expressions. Works with **Codex**, **GitHub Copilot**, **GitHub Copilot CLI**, **Cline**, **Cursor**, **Windsurf**, **Roo Code**, and any MCP-compatible assistant. Compatible with any VS Code supported coding language.
+Let AI agents debug your code inside VS Code - set breakpoints, step through execution, inspect variables, and evaluate expressions. Works with **Codex**, **GitHub Copilot**, **GitHub Copilot CLI**, **Claude Code**, **Cline**, **Cursor**, **Windsurf**, **Roo Code**, and any MCP-compatible assistant. Compatible with any VS Code supported coding language.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![VS Code](https://img.shields.io/badge/VS%20Code-1.104.0+-blue.svg)](https://code.visualstudio.com/)
-[![Version](https://img.shields.io/badge/version-2.3.4-green.svg)](https://github.com/microsoft/DebugMCP)
+[![Version](https://img.shields.io/badge/version-2.4.0-green.svg)](https://github.com/microsoft/DebugMCP)
 [![VS Marketplace](https://img.shields.io/badge/VS%20Marketplace-Install-blue.svg)](https://marketplace.visualstudio.com/items?itemName=ozzafar.debugmcpextension)
+
+
+> 🚀 **DebugMCP CLI is now available on npm!** Debug directly from the
+> terminal **without requiring VS Code or any IDE at all** by connecting AI
+> coding agents to explicitly configured Debug Adapter Protocol (DAP) adapters.
+> The debug adapter and target process **run in the background**. Install it with
+> `npm install --global debugmcp`, then run
+> `debugmcp configure --agent copilot-cli`. The CLI also installs the
+> `debug-live` skill automatically. **[View the package on npm](https://www.npmjs.com/package/debugmcp)**
 
 > ⭐ **If you find DebugMCP useful, please [star the repo on GitHub](https://github.com/microsoft/DebugMCP)!** It helps others discover the project and motivates continued development.
 
@@ -18,6 +27,9 @@ Let AI agents debug your code inside VS Code - set breakpoints, step through exe
 </p>
 
 ## ✨ What's New
+
+### 2.4
+- **Standalone DebugMCP CLI** — install [`debugmcp`](https://www.npmjs.com/package/debugmcp) from npm and give MCP-compatible agents direct access to explicitly configured DAP adapters without running VS Code. The CLI supports any language with a DAP adapter that communicates over stdio, configures supported agents, and installs the `debug-live` skill automatically.
 
 ### 2.2
 - **Cross-agent `debug-live` skill install** — the systematic debugging workflow ships as an [Agent Skill](https://agentskills.io) and is now installed into the **standard skills directories** — `~/.agents/skills/` (the cross-agent location honored by skills-compatible harnesses, including VS Code agent mode) and `~/.copilot/skills/` when present — so it's discoverable everywhere instead of being copied next to each agent's config where nothing scans it (fixes [#105](https://github.com/microsoft/DebugMCP/issues/105), where VS Code never loaded the skill). The server also advertises MCP `instructions` and the `start_debugging` tool points at the skill for the full workflow.
@@ -92,6 +104,68 @@ DebugMCP follows systematic debugging practices for effective issue resolution:
 
 ## Installation
 
+### Standalone CLI (preview)
+
+The standalone host talks directly to explicitly configured DAP adapters and
+does not require VS Code. It never discovers, downloads, installs, or selects an
+adapter automatically.
+
+Install the published package:
+
+```console
+npm install --global debugmcp
+```
+
+For repository development, build and invoke the local bundle:
+
+```console
+npm install
+npm run package
+node dist/debugmcp.js adapter add python --command "python -m debugpy.adapter"
+node dist/debugmcp.js adapter validate python
+node dist/debugmcp.js configure
+```
+
+Adapter registrations are stored in `.debugmcp.json` by default. Add `--user`
+to `adapter add`, `adapter list`, or `adapter remove` to use the per-user
+configuration. Project registrations override registrations with the same name
+in user configuration.
+
+Language shorthands derive the DAP type and file extensions for `python`,
+`csharp`, `dotnet`, `cpp`, `c`, `javascript`, `typescript`, `node`, `java`,
+`go`, `rust`, `ruby`, `php`, `swift`, and `dart`. These are configuration
+conveniences, not a language support boundary. The command remains explicit so
+the selected environment determines which adapter installation is used.
+Languages without a shorthand provide `--type` and `--extensions` explicitly.
+Compiled-language registrations can provide the executable in `--launch`;
+values support `${workspaceFolder}`, `${file}`, `${fileDirname}`, and
+`${fileBasenameNoExtension}`.
+
+The current CLI supports adapters that speak DAP over stdio. A registration can
+provide adapter-specific launch properties with `--launch` followed by a JSON
+object. If multiple registered adapters claim the same file extension,
+`start_debugging.configurationName` must identify the adapter to use. Test
+discovery remains host-specific; configure the adapter launch properties to run
+the required test command.
+
+Adapter arguments beginning with `--` can follow `--args` directly. Use a
+standalone `--` after `--args` when an adapter argument has the same name as a
+DebugMCP option, for example `--args -- --user`.
+
+`debugmcp configure` presents the same agent choices as the VS Code extension's
+setup popup and writes the standalone stdio command for every selected agent.
+In automation, repeat `--agent <id>` to bypass the terminal prompt, for example
+`debugmcp configure --agent copilot-cli --agent codex`. Each configuration has
+one canonical `debugmcp` entry, so configuring the CLI replaces an existing
+extension HTTP entry rather than registering both.
+The command also installs the bundled `debug-live` skill into the standard
+personal skills directories. Restart configured agents to discover it.
+
+Use `debugmcp status` to inspect the GitHub Copilot CLI registration. The
+DebugMCP command configures only the standalone CLI. To use the interactive
+VS Code version, configure it through the DebugMCP extension's agent popup;
+the command line does not select or configure the extension.
+
 ### Quick Install Options
 
 **Option 1: Direct Link** (Fastest)
@@ -133,6 +207,7 @@ DebugMCP works with any MCP-compatible AI assistant. It auto-detects and offers 
 |-----------|:-----------------:|:-------------:|
 | **GitHub Copilot** | ✅ | [See config](#github-copilot) |
 | **GitHub Copilot CLI** | ✅ | [See config](#github-copilot-cli) |
+| **Claude Code** | ✅ | [See config](#claude-code) |
 | **Cline** | ✅ | [See config](#cline) |
 | **Cursor** | ✅ | [See config](#cursor) |
 | **Codex** | ✅ | [See config](#codex) |
@@ -154,7 +229,7 @@ DebugMCP supports debugging for the following languages with their respective VS
 | **Go** | [Go](https://marketplace.visualstudio.com/items?itemName=golang.Go) | `.go` | ✅ Fully Supported |
 | **Rust** | [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer) | `.rs` | ✅ Fully Supported |
 | **PHP** | [PHP Debug](https://marketplace.visualstudio.com/items?itemName=xdebug.php-debug) | `.php` | ✅ Fully Supported |
-| **Ruby** | [Ruby](https://marketplace.visualstudio.com/items?itemName=rebornix.ruby) | `.rb` | ✅ Fully Supported |
+| **Ruby** | [Ruby](https://marketplace.visualstudio.com/items?itemName=Shopify.ruby-lsp) | `.rb` | ✅ Fully Supported |
 | **C#/.NET** | [C#](https://marketplace.visualstudio.com/items?itemName=ms-dotnettools.csharp) | `.cs`, `.csproj` | ✅ Fully Supported |
 | **AL (Business Central)** | [AL Language](https://marketplace.visualstudio.com/items?itemName=ms-dynamics-smb.al) | `.al`, virtual `.dal` | ✅ Supported with an AL launch configuration |
 
@@ -223,6 +298,26 @@ Add to `~/.copilot/mcp-config.json` (`${COPILOT_HOME}/mcp-config.json` if `COPIL
   }
 }
 ```
+
+#### Claude Code
+Register DebugMCP with Claude Code:
+```bash
+claude mcp add --transport http --scope user debugmcp http://localhost:3001/mcp
+```
+
+Or add the equivalent configuration to `~/.claude.json` (top-level `mcpServers`, for cross-project user-scope access — see the [Claude Code MCP docs](https://code.claude.com/docs/en/mcp)):
+```json
+{
+  "mcpServers": {
+    "debugmcp": {
+      "type": "http",
+      "url": "http://localhost:3001/mcp"
+    }
+  }
+}
+```
+
+> **Claude Desktop**: Claude Desktop connects to local/remote HTTP MCP servers through **Settings → Connectors → Add custom connector** rather than a static config file — paste `http://localhost:3001/mcp` there. DebugMCP doesn't auto-register with Desktop for this reason.
 
 #### Cursor
 Add to Cursor's MCP settings:
@@ -325,7 +420,7 @@ DebugMCP exposes powerful debugger primitives (`evaluate_expression`, `start_deb
 <details>
 <summary><b>Which AI assistants are supported?</b></summary>
 
-DebugMCP works with any MCP-compatible AI assistant, including **GitHub Copilot**, **GitHub Copilot CLI**, **Cline**, **Cursor**, **Codex**, **Windsurf**, **Roo Code**, **Antigravity**, and others. If your assistant supports the Model Context Protocol, it can use DebugMCP.
+DebugMCP works with any MCP-compatible AI assistant, including **GitHub Copilot**, **GitHub Copilot CLI**, **Claude Code**, **Cline**, **Cursor**, **Codex**, **Windsurf**, **Roo Code**, **Antigravity**, and others. If your assistant supports the Model Context Protocol, it can use DebugMCP. Claude Desktop can also connect via its Custom Connector UI (see [Claude Code](#claude-code) in the manual configuration section).
 </details>
 
 <details>
@@ -438,8 +533,8 @@ The extension handles debug configurations intelligently:
   - **Go**: [Go extension](vscode:extension/golang.go)
   - **Rust**: [rust-analyzer extension](vscode:extension/rust-lang.rust-analyzer)
   - **PHP**: [PHP Debug extension](vscode:extension/xdebug.php-debug)
-  - **Ruby**: [Ruby extension](vscode:extension/rebornix.ruby) with debug support
-- MCP-compatible AI assistant (Copilot, Cline, Cursor, Codex, Windsurf, Roo Code, etc.)
+  - **Ruby**: [Ruby extension](vscode:extension/Shopify.ruby-lsp) and the [`debug` gem](https://github.com/ruby/debug)
+- MCP-compatible AI assistant (Copilot, Claude Code, Cline, Cursor, Codex, Windsurf, Roo Code, etc.)
 
 ## Development
 
@@ -508,5 +603,4 @@ If DebugMCP has helped you debug faster, please consider giving it a star on Git
 ## License
 
 MIT License - See [LICENSE](LICENSE.txt) for details
-
 This extension was created by **Oz Zafar**, **Ori Bar-Ilan** and **Karin Brisker**.

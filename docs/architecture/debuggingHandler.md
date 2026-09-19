@@ -2,7 +2,9 @@
 
 ## Purpose
 
-High-level orchestration layer that coordinates debugging operations between the MCP server and VS Code's debug API. Handles the asynchronous nature of debugging by implementing state change detection.
+Host-neutral orchestration layer that coordinates debugging operations between
+the MCP server and an injected executor. The executor may use VS Code's debug
+API or host a DAP adapter directly in the standalone CLI.
 
 ## Motivation
 
@@ -49,7 +51,10 @@ After executing a debug command (step over, continue, etc.), the handler:
 
 ### Exponential Backoff
 
-Polling starts at 1 second intervals and increases exponentially (capped at 10 seconds for session activation, 1 second for state changes). Jitter is added to prevent thundering herd issues.
+State-change polling uses short bounded intervals so either executor can expose
+new stopped/running state without the handler depending on host-specific event
+APIs. Session activation remains delegated to the executor, which can use its
+native VS Code or DAP events.
 
 ### Meaningful State Changes
 
@@ -111,5 +116,14 @@ Recursive expansion is bounded to 100 child fields total per response, shared ac
 ## Error Handling
 
 All operations wrap errors with context about what operation failed, enabling AI agents to understand and potentially recover from failures.
+Startup preserves task/configuration errors from the executor instead of
+replacing them with an extension-installation hint. Readiness listeners are
+started only after configuration resolution and cancelled when the startup
+operation finishes or fails. Test-dispatch failures propagate as errors rather
+than being interpreted as successful test completion.
 Expression evaluation also distinguishes an adapter error from a successful
 command whose result/output was not captured.
+
+## Variable inspection
+
+For `ruby_lsp` sessions, Ruby scalar values keep their result even when rdbg attaches metadata children. Synthetic `#class` and `%ancestors` children are omitted only for Ruby. Existing secret redaction and names/types-only descendant rendering remain in force.

@@ -4,6 +4,10 @@
 
 Produces the argument passed to `vscode.debug.startDebugging()` — either a launch.json configuration name or a minimal `DebugConfiguration` stub.
 
+The standalone counterpart, `src/cli/cliConfigurationManager.ts`, resolves an
+explicit adapter registration from project or user configuration and produces
+the DAP launch/attach arguments. It intentionally has no default adapters.
+
 ## Motivation
 
 Earlier versions of this class manually parsed `launch.json`, scored configurations, and assembled fully populated per-language config objects. That duplicated work VS Code and the language debug extensions already do better:
@@ -17,12 +21,21 @@ Delegating to those mechanisms keeps this class small and ensures defaults stay 
 
 - Return a launch.json configuration name when the caller provides one — VS Code looks it up itself.
 - Otherwise, return a minimal launch stub (`type`, `request`, `name`, `program`) for the file's language and let the language extension resolve the rest.
+- For Ruby, select Shopify Ruby LSP's `ruby_lsp` adapter and pass `command: 'ruby'` and `file` separately so the adapter quotes the path.
 - For `.NET` (`coreclr`), locate the project's built DLL since `program` cannot be a `.cs` source file.
 - Detect the debugger `type` from a file extension.
 
 **Test debugging is not handled here.** It is routed through `DebuggingExecutor.debugTestAtCursor`, which uses VS Code's built-in `testing.debugAtCursor` command to dispatch to whichever `TestController` owns the test under the cursor. That path supports any language whose extension registers a Test Explorer integration and correctly handles parent/child process attach (e.g. `dotnet test`'s testhost).
 
 ## Key Concepts
+
+### Standalone adapter selection
+
+The CLI merges user registrations with `.debugmcp.json`, with project entries
+overriding user entries of the same name. It selects the sole adapter claiming
+the source extension, or the adapter named by `configurationName`. Missing and
+ambiguous registrations fail with configuration commands instead of triggering
+environment discovery or installation.
 
 ### Return type
 
@@ -39,7 +52,7 @@ Maps file extensions to debugger `type` values:
 - `.go` → `go`
 - `.rs` → `lldb`
 - `.php` → `php`
-- `.rb` → `ruby`
+- `.rb` → `ruby_lsp`
 
 ### Test framework support
 
@@ -49,7 +62,8 @@ Test launches are dispatched via `DebuggingExecutor.debugTestAtCursor`, not via 
 
 1. If `configurationName` is provided and is not the sentinel `Default Configuration`, return that name verbatim.
 2. Otherwise, if the file is C# (`coreclr`), walk up to find the `.csproj`, locate its built DLL under `bin/{Debug,Release}/<tfm>/`, and return a coreclr config pointing at that assembly.
-3. Otherwise, return `{ type, request: 'launch', name: 'DebugMCP Launch', program: fileFullPath }`.
+3. For Ruby (`ruby_lsp`), return `{ type, request: 'launch', name: 'DebugMCP Launch', command: 'ruby', file: fileFullPath }`.
+4. Otherwise, return `{ type, request: 'launch', name: 'DebugMCP Launch', program: fileFullPath }`.
 
 ## Key code locations
 

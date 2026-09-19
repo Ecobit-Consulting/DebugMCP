@@ -208,15 +208,28 @@ suite('DebuggingHandler waitForStateChange (event-driven)', () => {
         assert.ok(elapsed >= 200, `should wait for the ~300ms timeout, only took ${elapsed}ms`);
         assert.ok(elapsed < 3000, `timeout should bound the wait, took ${elapsed}ms`);
     });
+
+    test('dispose forwards cleanup to the executor', async () => {
+        const executor = makeExecutor(() => lineState(10));
+        let disposeCalls = 0;
+        executor.dispose = async () => {
+            disposeCalls++;
+        };
+        const handler = new DebuggingHandler(executor, {} as any, 30);
+
+        await handler.dispose();
+
+        assert.strictEqual(disposeCalls, 1);
+    });
 });
 
 suite('DebuggingHandler virtual source breakpoints', () => {
 	test('passes an AL-style virtual .dal URI through breakpoint, logpoint, and removal operations', async () => {
 		const scheme = `al-preview-test-${Date.now()}`;
 		const source = `${scheme}://AlLang/437dbf0e84ff417a965ded2bb9650972/Table/18/Customer.dal`;
-		const added: Array<{ uri: vscode.Uri; line: number; logMessage?: string }> = [];
-		let removedUri: vscode.Uri | undefined;
-		let breakpoints: vscode.Breakpoint[] = [];
+		const added: Array<{ fileFullPath: string; line: number; logMessage?: string }> = [];
+		let removedPath: string | undefined;
+		let breakpoints: any[] = [];
 		const provider = vscode.workspace.registerTextDocumentContentProvider(scheme, {
 			provideTextDocumentContent: () => 'table 18 Customer\n{\n}'
 		});
@@ -230,8 +243,8 @@ suite('DebuggingHandler virtual source breakpoints', () => {
 			continue: async () => { /* noop */ },
 			pause: async () => { /* noop */ },
 			restart: async () => { /* noop */ },
-			addBreakpoint: async (uri, line, _condition, logMessage) => { added.push({ uri, line, logMessage }); },
-			removeBreakpoint: async (uri) => { removedUri = uri; },
+			addBreakpoint: async (fileFullPath, line, _condition, logMessage) => { added.push({ fileFullPath, line, logMessage }); },
+			removeBreakpoint: async (fileFullPath) => { removedPath = fileFullPath; },
 			getCurrentDebugState: async () => new DebugState(),
 			getVariables: async () => ({}),
 			getVariableChildren: async () => [],
@@ -251,20 +264,15 @@ suite('DebuggingHandler virtual source breakpoints', () => {
 				line: 1,
 				logMessage: 'Customer {Rec.SystemId}'
 			});
-			breakpoints = [new vscode.SourceBreakpoint(new vscode.Location(added[0].uri, new vscode.Position(1, 0)))];
+			breakpoints = [{ fileFullPath: source, line: 2 }];
 			const removalResult = await handler.handleRemoveBreakpoint({ fileFullPath: source, line: 2 });
 
-			assert.strictEqual(added[0].uri.scheme, scheme);
-			assert.strictEqual(added[0].uri.authority, 'AlLang');
-			assert.strictEqual(
-				added[0].uri.path,
-				'/437dbf0e84ff417a965ded2bb9650972/Table/18/Customer.dal'
-			);
+			assert.strictEqual(added[0].fileFullPath, source);
 			assert.strictEqual(added[0].line, 2);
-			assert.strictEqual(added[1].uri.toString(), added[0].uri.toString());
+			assert.strictEqual(added[1].fileFullPath, source);
 			assert.strictEqual(added[1].line, 1);
 			assert.strictEqual(added[1].logMessage, 'Customer {Rec.SystemId}');
-			assert.strictEqual(removedUri?.toString(), added[0].uri.toString());
+			assert.strictEqual(removedPath, source);
 			assert.match(breakpointResult, /Breakpoint added/);
 			assert.match(logpointResult, /Logpoint added/);
 			assert.match(removalResult, /Breakpoint removed/);
