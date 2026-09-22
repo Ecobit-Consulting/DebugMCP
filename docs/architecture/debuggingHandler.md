@@ -45,10 +45,10 @@ Debugging is inherently asynchronous - when you step over a line, the debugger t
 After executing a debug command (step over, continue, etc.), the handler:
 1. Captures "before" state
 2. Executes the command via executor
-3. Polls for state changes using exponential backoff
+3. Polls for state changes at short bounded intervals
 4. Returns the "after" state when a meaningful change is detected
 
-### Exponential Backoff
+### Bounded Polling
 
 State-change polling uses short bounded intervals so either executor can expose
 new stopped/running state without the handler depending on host-specific event
@@ -57,12 +57,34 @@ native VS Code or DAP events.
 
 ### Meaningful State Changes
 
-A state change is considered meaningful when any of these change:
+A fresh observed stopped-event sequence completes a step, even at the same source
+line with reused frame IDs, or with no source/stack at all. Resuming or refreshing
+the UI alone does not complete a step. Session termination also completes the
+wait. The VS Code and CLI executors supply the same internal snapshot marker.
+
+When neither snapshot has an observed stopped-event sequence, the compatibility
+fallback considers changes to:
 - Session active status
 - Current file path
 - Current line number
 - Frame name (function/method)
 - Frame ID
+- Thread ID
+
+### Paused State and Pause Requests
+
+Paused status uses the executor's observed stopped/running state, independently
+of source and stack availability. If execution state has not been observed (for
+example, a session that predates tracking), an active frame/thread context is the
+fallback. A bare selected thread alone is not proof of a stop.
+Native/disassembly frames, unavailable local files, and empty stacks can all
+occur while stopped. Status waits and navigation use this same distinction;
+losing source information alone is not a resume.
+
+`handlePause()` is idempotent for an already-paused session: it returns the current
+state without issuing another pause or waiting for a location change. For a
+running session, it dispatches pause and waits for a stopped state or session
+termination, bounded by the operation timeout.
 
 ### Root Cause Analysis
 

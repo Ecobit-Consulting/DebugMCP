@@ -27,6 +27,8 @@ export class CliDebuggingExecutor implements IDebuggingExecutor {
 	private frameId?: number;
 	private capabilities: Record<string, unknown> = {};
 	private initialized = false;
+	private stateRevision = 0;
+	private stopSequence = 0;
 
 	public async startDebugging(
 		workingDirectory: string,
@@ -212,30 +214,31 @@ export class CliDebuggingExecutor implements IDebuggingExecutor {
 	}
 
 	public async getCurrentDebugState(numNextLines = 3): Promise<DebugState> {
-		const result = new DebugState();
-		result.sessionActive = this.state !== 'none' && this.state !== 'terminated';
-		result.updateConfigurationName(this.session?.name ?? null);
-		result.updateBreakpoints(this.breakpoints.map(item => {
-			const suffix = item.condition ? ` [when: ${item.condition}]` : '';
-			return `${path.basename(item.fileFullPath)}:${item.line}${suffix}`;
-		}));
-
+		const result = this.createStateSnapshot();
 		if (!result.sessionActive || this.state !== 'stopped' || this.threadId === undefined) {
 			return result;
 		}
 
-		const response = await this.requireClient().request('stackTrace', {
-			threadId: this.threadId,
+		const client = this.requireClient();
+		const threadId = this.threadId;
+		const revision = this.stateRevision;
+		const isCurrent = () => this.client === client && this.state === 'stopped' &&
+			this.threadId === threadId && this.stateRevision === revision;
+		const response = await client.request('stackTrace', {
+			threadId,
 			startFrame: 0,
 			levels: 50
 		});
+		if (!isCurrent()) {
+			return this.createStateSnapshot();
+		}
 		const frames = Array.isArray(response?.stackFrames) ? response.stackFrames : [];
 		if (frames.length === 0) {
+			this.frameId = undefined;
 			return result;
 		}
 		const current = frames[0];
-		this.frameId = current.id;
-		result.updateContext(current.id, this.threadId);
+		result.updateContext(current.id, threadId);
 		result.updateFrameName(current.name ?? null);
 		result.updateStackTrace(frames.map((frame: any): StackFrame => ({
 			name: frame.name ?? 'unknown',
@@ -247,6 +250,23 @@ export class CliDebuggingExecutor implements IDebuggingExecutor {
 		if (typeof current.source?.path === 'string' && typeof current.line === 'number') {
 			await this.populateSource(result, current.source.path, current.line, numNextLines);
 		}
+		if (!isCurrent()) {
+			return this.createStateSnapshot();
+		}
+		this.frameId = current.id;
+		return result;
+	}
+
+	private createStateSnapshot(): DebugState {
+		const result = new DebugState();
+		result.sessionActive = this.state !== 'none' && this.state !== 'terminated';
+		result.paused = this.state === 'stopped';
+		result.stopSequence = result.paused && this.stopSequence > 0 ? this.stopSequence : null;
+		result.updateConfigurationName(this.session?.name ?? null);
+		result.updateBreakpoints(this.breakpoints.map(item => {
+			const suffix = item.condition ? ` [when: ${item.condition}]` : '';
+			return `${path.basename(item.fileFullPath)}:${item.line}${suffix}`;
+		}));
 		return result;
 	}
 
@@ -351,6 +371,7 @@ export class CliDebuggingExecutor implements IDebuggingExecutor {
 
 	private registerClientEvents(client: DapClient): void {
 		client.on('stopped', body => {
+			this.stopSequence++;
 			this.threadId = typeof body.threadId === 'number' ? body.threadId : this.threadId;
 			this.frameId = undefined;
 			this.state = 'stopped';
@@ -391,6 +412,7 @@ export class CliDebuggingExecutor implements IDebuggingExecutor {
 	}
 
 	private emitState(): void {
+		this.stateRevision++;
 		this.events.emit('state');
 	}
 

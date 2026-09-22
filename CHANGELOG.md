@@ -9,6 +9,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 ### Added
 - **Claude Code auto-registration** - Claude Code is now offered in the agent selection popup and configured via `~/.claude.json`'s user-scope `mcpServers` field. Claude Desktop connects via its Custom Connector UI instead of a static config file; the README's manual configuration section covers both.
 
+## [2.4.1] - 2026-09-17
+
+### Fixed
+- Track stopped/continued debugger events so `get_debug_status` recognizes paused targets even when source or stack frames are unavailable. `pause_execution` now returns immediately for an already-paused session instead of waiting for another step or the operation timeout (#157).
+- Complete step operations on a fresh stopped event even when frame IDs and source locations are unchanged or the stack is empty, avoiding hangs until a manual step or timeout in VS Code and the standalone CLI (#157).
+
 ## [2.3.5] - 2026-09-09
 
 ### Fixed
