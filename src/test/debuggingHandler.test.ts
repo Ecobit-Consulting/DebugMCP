@@ -7,7 +7,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { DebugState } from '../debugState';
 import { DebuggingHandler } from '../debuggingHandler';
-import { IDebuggingExecutor } from '../debuggingExecutor';
+import { DebuggingExecutor, IDebuggingExecutor } from '../debuggingExecutor';
 import { IDebugConfigurationManager } from '../utils/debugConfigurationManager';
 
 /**
@@ -335,6 +335,7 @@ suite('DebuggingHandler virtual source breakpoints', () => {
 			provideTextDocumentContent: () => 'table 18 Customer\n{\n}'
 		});
 		const executor: IDebuggingExecutor = {
+			getFileLineCount: source => DebuggingExecutor.prototype.getFileLineCount(source),
 			startDebugging: async () => true,
 			debugTestAtCursor: async () => ({ started: true, runComplete: Promise.resolve() }),
 			stopDebugging: async () => { /* noop */ },
@@ -359,6 +360,10 @@ suite('DebuggingHandler virtual source breakpoints', () => {
 
 		try {
 			const handler = new DebuggingHandler(executor, {} as any, 30);
+			await assert.rejects(
+				handler.handleAddBreakpoint({ fileFullPath: source, line: 4 }),
+				/out of range.*has 3 lines/
+			);
 			const breakpointResult = await handler.handleAddBreakpoint({ fileFullPath: source, line: 2 });
 			const logpointResult = await handler.handleAddLogpoint({
 				fileFullPath: source,
