@@ -6,6 +6,7 @@ import { DebugState } from './debugState';
 import { IDebuggingExecutor } from './debuggingExecutor';
 import { logger } from './utils/logger';
 import { isSourceUri } from './utils/sourceUri';
+import { withTimeout } from './utils/withTimeout';
 import {
     isSensitiveExpression,
     isSensitiveName,
@@ -50,8 +51,14 @@ function describeLocation(state: DebugState): string {
     if (!state.sessionActive) {
         return '<session ended>';
     }
-    if (!state.hasLocationInfo()) {
+    if (!state.isPaused()) {
         return '<running, no frame>';
+    }
+    if (!state.hasValidContext()) {
+        return '<paused, no stack frame>';
+    }
+    if (!state.hasLocationInfo()) {
+        return '<paused, source unavailable>';
     }
     return `${state.fileName}:${state.currentLine}`;
 }
@@ -61,7 +68,6 @@ function describeLocation(state: DebugState): string {
  */
 export class DebuggingHandler implements IDebuggingHandler {
     private readonly numNextLines: number = 3;
-    private readonly executionDelay: number = 300; // ms to wait for debugger updates
     private readonly timeoutInSeconds: number;
 
     constructor(
@@ -215,7 +221,7 @@ export class DebuggingHandler implements IDebuggingHandler {
     private async navigate(
         operation: string,
         run: () => Promise<void>,
-        settleOnResume = false
+        completion: 'state-change' | 'resume' | 'pause' = 'state-change'
     ): Promise<string> {
         try {
             if (!(await this.executor.hasActiveSession())) {
@@ -226,13 +232,17 @@ export class DebuggingHandler implements IDebuggingHandler {
             const beforeState = await this.executor.getCurrentDebugState(this.numNextLines);
             logger.info(`${operation}: from ${describeLocation(beforeState)}`);
 
+            // Pausing an already-stopped target produces no new stop or location.
+            if (completion === 'pause' && beforeState.isPaused()) {
+                return beforeState.toString();
+            }
+
             const startedAt = Date.now();
             await run();
 
-            // Wait for the debugger to leave its current stop. For a step that
-            // means the next frame; for a continue, "running again" is itself
-            // the terminal state (see waitForStateChange).
-            const afterState = await this.waitForStateChange(beforeState, settleOnResume);
+            const afterState = completion === 'pause'
+                ? await this.waitForPause(this.timeoutInSeconds * 1000)
+                : await this.waitForStateChange(beforeState, completion === 'resume');
             const elapsedMs = Date.now() - startedAt;
 
             logger.info(
@@ -272,7 +282,7 @@ export class DebuggingHandler implements IDebuggingHandler {
      * Continue execution
      */
     public async handleContinue(): Promise<string> {
-        return this.navigate('continue', () => this.executor.continue(), true);
+        return this.navigate('continue', () => this.executor.continue(), 'resume');
     }
 
     /**
@@ -305,11 +315,11 @@ export class DebuggingHandler implements IDebuggingHandler {
 
             const startedAt = Date.now();
             let state = await this.executor.getCurrentDebugState(this.numNextLines);
-            if (waitSeconds > 0 && state.sessionActive && !state.hasLocationInfo()) {
+            if (waitSeconds > 0 && state.sessionActive && !state.isPaused()) {
                 state = await this.waitForPause(waitSeconds * 1000);
             }
 
-            const paused = state.sessionActive && state.hasLocationInfo();
+            const paused = state.isPaused();
             logger.info(
                 `debug status: ${paused ? 'paused' : 'running'} at ${describeLocation(state)} ` +
                     `after ${Date.now() - startedAt}ms (waited up to ${waitSeconds}s)`
@@ -354,7 +364,7 @@ export class DebuggingHandler implements IDebuggingHandler {
         const deadline = Date.now() + timeoutMs;
         while (Date.now() < deadline) {
             const state = await this.executor.getCurrentDebugState(this.numNextLines);
-            if (!state.sessionActive || state.hasLocationInfo()) {
+            if (!state.sessionActive || state.isPaused()) {
                 return state;
             }
             await new Promise(resolve => setTimeout(resolve, Math.min(100, deadline - Date.now())));
@@ -368,7 +378,7 @@ export class DebuggingHandler implements IDebuggingHandler {
      * (e.g. a busy loop or an embedded/bare-metal target that is running freely).
      */
     public async handlePause(): Promise<string> {
-        return this.navigate('pause', () => this.executor.pause());
+        return this.navigate('pause', () => this.executor.pause(), 'pause');
     }
 
     /**
@@ -380,10 +390,15 @@ export class DebuggingHandler implements IDebuggingHandler {
                 throw new Error('No active debug session to restart');
             }
 
-            await this.executor.restart();
-            
-            // Wait for debugger to restart
-            await new Promise(resolve => setTimeout(resolve, this.executionDelay));
+            await withTimeout(
+                this.executor.restart(),
+                this.timeoutInSeconds * 1000,
+                () => new Error(
+                    `Restart timed out after ${this.timeoutInSeconds}s without completion acknowledgement. ` +
+                    'The target may already have restarted; the request has not been cancelled. ' +
+                    'Check get_debug_status and the Debug Console before retrying.'
+                )
+            );
 
             return 'Debug session restarted successfully';
         } catch (error) {
@@ -986,16 +1001,14 @@ export class DebuggingHandler implements IDebuggingHandler {
      * completes in tens of milliseconds. There is no early-wakeup — a state
      * change 10ms into the sleep is ignored for the rest of the second.
      *
-     * This version subscribes to the same events the start path already uses
-     * (`onDidChangeActiveStackItem` for a new stopped frame, plus session
-     * termination) so it reacts the instant the step lands. A fast-path check
-     * covers the case where the step already completed before we got here, and
-     * a timeout bounds the no-event/never-stops case.
+     * Short bounded polls work with both VS Code and standalone executors. An
+     * immediate check covers steps that already completed; the timeout bounds
+     * operations that never reach another stop.
      *
      * `settleOnResume` (continue only) additionally treats "running again, no
      * stack frame" as a terminal state. `hasStateChanged` deliberately reports
      * paused -> running as "no change" so that a step isn't settled by the
-     * transient frameless moment mid-step; for a continue, though, that state
+     * transient running moment mid-step; for a continue, though, that state
      * is the successful outcome, and a process that keeps running (a server, an
      * event loop) never produces the next frame the step path waits for.
      */
@@ -1005,7 +1018,7 @@ export class DebuggingHandler implements IDebuggingHandler {
         const deadline = Date.now() + timeoutMs;
         while (Date.now() < deadline) {
             const currentState = await this.executor.getCurrentDebugState(this.numNextLines);
-            const resumed = settleOnResume && currentState.sessionActive && !currentState.hasLocationInfo();
+            const resumed = settleOnResume && currentState.sessionActive && !currentState.isPaused();
             if (this.hasStateChanged(beforeState, currentState) || !currentState.sessionActive || resumed) {
                 return currentState;
             }
@@ -1031,7 +1044,7 @@ export class DebuggingHandler implements IDebuggingHandler {
      * Determine if the debugger state has meaningfully changed
      */
     private hasStateChanged(beforeState: DebugState, afterState: DebugState): boolean {
-        if (beforeState.hasLocationInfo() && !afterState.hasLocationInfo() && afterState.sessionActive) {
+        if (beforeState.isPaused() && !afterState.isPaused() && afterState.sessionActive) {
             return false;
         }
 
@@ -1044,11 +1057,22 @@ export class DebuggingHandler implements IDebuggingHandler {
         if (!afterState.sessionActive) {
             return true;
         }
-        
-        // If either state lacks location info, compare what we can
-        if (!beforeState.hasLocationInfo() || !afterState.hasLocationInfo()) {
-            // If one has location info and the other doesn't, that's a change
-            return beforeState.hasLocationInfo() !== afterState.hasLocationInfo();
+
+        // A completed step can reuse every frame/location field, or have no stack.
+        // Once stops are observed, UI-only changes must not settle a pending step.
+        if (beforeState.stopSequence !== null || afterState.stopSequence !== null) {
+            return afterState.isPaused() && afterState.stopSequence !== null &&
+                beforeState.stopSequence !== afterState.stopSequence;
+        }
+
+        if (beforeState.isPaused() !== afterState.isPaused() ||
+            beforeState.hasValidContext() !== afterState.hasValidContext()) {
+            return true;
+        }
+
+        // Frame/thread changes remain meaningful without readable source.
+        if (beforeState.threadId !== afterState.threadId) {
+            return true;
         }
         
         // Compare file paths - if we moved to a different file, that's a change

@@ -6,9 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Fixed
+- Standalone CLI breakpoint tools remain usable between debug sessions. Adding, removing, and clearing breakpoints after termination, stopping, disposal, or failed startup no longer try to synchronize with an inactive adapter; saved changes are applied on the next launch (#161).
+
 ### Added
 - Breakpoint, logpoint, and removal tools now support VS Code virtual-document URIs, including Business Central   sources. An optional  selects the correct workspace when multiple editor windows are open.
 - **Claude Code auto-registration** - Claude Code is now offered in the agent selection popup and configured via 's user-scope  field. Claude Desktop connects via its Custom Connector UI instead of a static config file; the README's manual configuration section covers both.
+
+## [2.4.2] - 2026-09-27
+
+### Fixed
+- Bound `restart_debugging` by the configured operation timeout, preserving restart failures and reporting unacknowledged completion instead of leaving the worker call pending. This safeguards against Cortex-Debug v1.12.1's missing successful restart response without mistaking stopped events for confirmed success (#160).
+
+## [2.4.1] - 2026-09-17
+
+### Fixed
+- Track stopped/continued debugger events so `get_debug_status` recognizes paused targets even when source or stack frames are unavailable. `pause_execution` now returns immediately for an already-paused session instead of waiting for another step or the operation timeout (#157).
+- Complete step operations on a fresh stopped event even when frame IDs and source locations are unchanged or the stack is empty, avoiding hangs until a manual step or timeout in VS Code and the standalone CLI (#157).
 
 ## [2.3.5] - 2026-09-09
 

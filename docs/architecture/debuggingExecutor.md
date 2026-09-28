@@ -49,6 +49,10 @@ short stop-event grace period so immediately reached breakpoints are reported,
 while still returning promptly for long-running programs.
 Closing an MCP session disposes its standalone executor, adapter process, and
 any debuggee processes started through reverse `runInTerminal` requests.
+Adapter initialization is session-scoped and is cleared on termination, shutdown,
+and failed startup. Breakpoints remain executor-scoped: edits between sessions
+are stored locally and synchronized after the next adapter initializes, while
+edits during an initialized session are synchronized immediately.
 `src/cli/adapterConfig.ts` loads project and user registrations. No adapter is
 registered, discovered, selected, installed, or upgraded implicitly.
 
@@ -109,9 +113,13 @@ text that Cortex-Debug does not include in its `evaluate` response:
 
 A session is considered "ready" when:
 1. `vscode.debug.activeDebugSession` exists
-2. Location info is available (file name and line number)
+2. An active stack frame is available (frame and thread IDs), even without source
 
 This handles cases where the debugger is still initializing (common with Python).
+This startup readiness check is intentionally stronger than paused status: a
+frameless stop can be reported by status without claiming frame inspection is
+ready. Observed running state rejects stale UI frames. Attach sessions can also
+be ready while the target remains running.
 `waitForDebugSessionReady()` accepts cancellation so a failed startup does not
 leave its readiness timeout and event subscriptions behind.
 
@@ -119,9 +127,38 @@ leave its readiness timeout and event subscriptions behind.
 
 `getCurrentDebugState()` queries multiple VS Code APIs:
 - `vscode.debug.activeDebugSession` - Session existence
+- The injected `DebugSessionTracker` - Observed DAP execution state
 - `vscode.debug.activeStackItem` - Frame/thread context
-- `vscode.window.activeTextEditor` - Current file and line
-- DAP `stackTrace` request - Frame name
+- DAP `stackTrace` request - Frame name, call stack, and source location
+- Source document lookup - Optional line contents and lookahead
+
+Frame/thread context is populated before source lookup. A missing or unreadable
+source does not discard that context or mean that execution is running. Paused
+status is also independent of frames: an observed stop with an empty stack still
+reports paused, while an observed continue overrides stale UI frame information.
+Unobserved sessions retain the frame-based fallback; a selected thread alone does
+not establish a pause.
+
+`src/utils/debugSessionTracker.ts` is a read-only observer of standard DAP
+`stopped`, `continued`, `exited`, and `terminated` events. It tracks sessions and
+thread-specific versus all-thread transitions separately. A selected thread uses
+its observed state; without a selected thread, any known stop establishes paused
+status. Activation creates one tracker and owns its disposal; test-created
+executors can omit it. Session termination and adapter shutdown clear tracked
+execution state without retaining terminated session objects.
+
+Snapshots also carry an internal stopped-event sequence. Unlike the revision used
+to reject stale asynchronous reads, it advances only on a stop, so an unchanged
+source location or an empty stack cannot hide a completed step. Selected-thread
+markers are unaffected by other threads' partial transitions; all-thread and
+unscoped stops remain observable without a selected frame. The CLI supplies the
+same marker from its stopped events. These markers are not added to tool output.
+
+After asynchronous stack/source lookups, execution transitions, a changed or
+cleared frame, or an ended session invalidate the old frame snapshot. The latest
+observed stopped/running state is retained even when frame information is
+discarded. The CLI likewise reports its DAP-backed execution state independently
+of its stack and rejects frame data spanning execution transitions.
 
 ## Key Code Locations
 

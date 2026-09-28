@@ -19,7 +19,9 @@ Debugging operations are asynchronous - the debugger takes time to execute and u
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `sessionActive` | `boolean` | Whether a debug session is running |
+| `sessionActive` | `boolean` | Whether a debug session exists, running or stopped |
+| `paused` | `boolean \| null` | Observed execution state, or `null` when unobserved |
+| `stopSequence` | `number \| null` | Internal executor-local stopped-event marker, independent of frames and source |
 | `fileFullPath` | `string \| null` | Full path to current file |
 | `fileName` | `string \| null` | Just the filename |
 | `currentLine` | `number \| null` | 1-based line number |
@@ -33,7 +35,8 @@ Debugging operations are asynchronous - the debugger takes time to execute and u
 
 | Method | Purpose |
 |--------|---------|
-| `hasValidContext()` | Check if frame/thread IDs are set |
+| `isPaused()` | Check observed stopped state, falling back to frame context only when unknown |
+| `hasValidContext()` | Check for an active session with frame/thread IDs for inspection |
 | `hasLocationInfo()` | Check if file/line info is available |
 | `hasFrameName()` | Check if frame name is available |
 | `clone()` | Create a deep copy for comparison |
@@ -52,7 +55,7 @@ Debugging operations are asynchronous - the debugger takes time to execute and u
 1. Capture before state: beforeState = executor.getCurrentDebugState()
 2. Execute debug command
 3. Poll for changes: compare beforeState with currentState
-4. State changed when: file, line, frame, or session status differs
+4. Step completed when a fresh stop is observed or the session ends; unobserved sessions fall back to location/context comparison
 ```
 
 ## Design Notes
@@ -60,3 +63,14 @@ Debugging operations are asynchronous - the debugger takes time to execute and u
 - **Immutable by convention**: Use `clone()` when you need a snapshot
 - **Incremental building**: State is built via multiple update calls during retrieval
 - **Null-safe**: All optional fields default to null, with helper methods to check validity
+- **Independent execution state**: A stopped target need not provide a stack frame,
+  source path, or readable source. Explicit running state overrides stale frame IDs;
+  missing frames are never replaced by fabricated identifiers.
+- **Compatibility fallback**: Sessions that predate DAP observation use available
+  frame/thread context to infer a pause. A selected thread alone is insufficient.
+- **Snapshot lifecycle**: Cloning preserves observed execution state; resetting
+  returns it to unknown. JSON output includes the computed `isPaused()` boolean,
+  so an inactive session is never serialized as paused.
+- **Stop identity**: A new stopped event advances `stopSequence` even if the
+  adapter reuses the frame ID and location or returns no frames. This internal
+  comparison marker is cloned/reset with the snapshot but omitted from tool JSON.
